@@ -1,0 +1,682 @@
+// Copyright (c) 2009-2018 LG Electronics, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#include <glib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
+#include <sys/time.h>
+#include <time.h>
+#include <stdint.h>
+#include <regex.h>
+#include <syslog.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#include <errno.h>
+
+#include <stdlib.h>
+#include <sys/wait.h>
+
+#include <cstdio>
+#include <string>
+#include <vector>
+#include <fstream>
+
+#include <cstdlib>
+
+unsigned long int strtoul ( const char * str, char ** endptr, int base );
+#include "ApplicationInstallerErrors.h"
+
+//WARNING: for debug only! highly brittle against various system defines (especially 64bit ones)
+typedef int (*statfsfn)(const char *, struct statfs *);
+typedef int (*statvfsfn)(const char *,struct statvfs *);
+
+
+enum InstallType {
+        INSTALL_INTERNAL,
+        INSTALL_DEVELOPER
+};
+
+static const char* s_lunaConfPath = "@WEBOS_INSTALL_WEBOS_SYSCONFDIR@/luna.conf";
+static gboolean    s_ipkgVerify = FALSE;
+static gboolean    s_allowDowngrade = FALSE;
+static gboolean    s_allowReInstall = FALSE;
+static int         s_uncompressedAppSizeInKB = 0;
+static InstallType s_installType = INSTALL_INTERNAL;
+static std::string s_appInstallBase     = "@WEBOS_INSTALL_CRYPTOFSDIR@/apps";
+// TODO : if there is proper env value, replace "/media/developer" to env value
+static std::string s_appDeveloperInstallBase = "/media/developer/apps";
+static std::string s_appInternalInstallBase = "@WEBOS_INSTALL_CRYPTOFSDIR@/apps";
+static std::string s_appUsbInstallBase = "/tmp/usb/sda/sda1/cryptofs/apps";
+static std::string s_serviceInstallBase = "@WEBOS_INSTALL_CRYPTOFSDIR@/apps";
+static std::string s_appInstallScripts  = "@WEBOS_INSTALL_CRYPTOFSDIR@/apps/.scripts";
+static std::string s_appInstallTmp      = "@WEBOS_INSTALL_CRYPTOFSDIR@/tmp";
+static std::string s_appInstallRelative = "usr/palm/applications";
+static std::string s_serviceInstallRelative = "usr/palm/services";
+static std::string s_packageInstallRelative = "usr/palm/packages";
+static std::string s_servicePostInstallScript = "@WEBOS_INSTALL_BINDIR@/pmServicePostInstall.sh";
+static std::string s_findFileScript = "@WEBOS_INSTALL_BINDIR@/find_file_in_archive.sh";
+
+static std::string s_command;
+static std::string s_package;
+static std::string s_conf;
+static bool        s_useSysLog = true;
+
+static int 		   s_cleanupCode = 3;			//0 = clean up nothing, 1 = clean up target package , 2 = clean up temp dir   (bitfield)
+
+/*
+ * FOR DEBUGGING  - s_dbg_failstage, s_dbg_crashfail, and dbg_faillist
+ *
+ * These are both settable in luna.conf (sysmgr's conf file, usually in /etc/palm)
+ * 	[Debug], "FailAtStage" -> s_dbg_failstage
+ *  [Debug], "SpectacularFailMode" -> s_dbg_crashfail
+ *	[Debug], "FailOnlyThesePackages" -> dbg_faillist
+ *
+ *  they are pretty self explanatory, and are essentially for QA to test fail scenarios without having to sabotage networks, servers, or packages =)
+ *
+ *  FailAtStage should be 0 for normal operation
+ *  SpectacularFailMode:
+ *  		if false, then the fail will just be a soft-fail, where this process will exit normally, with an error meaningful to sysmgr's installer routines/shells
+ *  		if true, then the fail will crash the process! this will result in an abnormal return to sysmgr and...well, hopefully a graceful recovery!
+ *  		if FailAtStage == 0, then this value doesn't matter
+ *
+ *	FailOnlyThesePackages:
+ *		This is a string of colon (:) separated package id's OR package filenames (without the path
+ *		example:     FailOnlyThesePackages=com.palm.app.test:com.food.app.bread:testPackage_1.0.ipk
+ *		(you can mix and match ids and filenames). Please do not embed whitespace between the colons and the names, nor have whitespace in the filenames!
+ *
+ *		If specified, it will only apply the failure debug actions to the packages specified. The dual format of id and filename is supported because until stage 3 of the install, the installer
+ *		doesn't actually know the package or app id of the installing package.
+ *
+ */
+
+static int			s_dbg_failstage = 0;			//0 = don't fail,  1 = fail at unpack ipk , 2 = fail at verify , 3 = fail at install , 4 = fail post install
+static bool			s_dbg_crashfail = false;		// if s_dbg_failstage == 0 then this does nothing. Otherwise, if true, it will cause this process to crash for the failure
+static std::vector<std::string> s_dbg_failpackages;
+
+// estimated size of uncompressed app is this value * x (where x is size of a compressed file/package, etc)
+#define INSTALLER_DEFV__MIN_FREE_MULT		2
+
+// amount to reserve for the app database, for each app, in bytes
+//#define	INSTALLER_DEFV__APPDB_RESERVE_SPACE_BYTES			(1*1024*1024)
+#define INSTALLER_DEFV__APPDB_RESERVE_SPACE_BYTES 0
+
+// default amount total reserved for app installation, in bytes
+#define INSTALLER_DEFV__DEFAULT_TOTAL_APP_RESERVE_BYTES		((off_t)(100*1024*1024))
+
+// default for allowing downloads of packages to the media partition
+#define INSTALLER_DEFV__MIN_FREE_TO_DL_ON_MEDIA_BYTES		((off_t)(5*1024*1024))
+
+static const char*      s_pkginstallerExec            = "@PACKAGE_MANAGER@";
+static const char*      s_pkginstallerOpts_location   = "-o";
+static const char*      s_pkginstallerOpts_conf       = "-f";
+static const char*      s_pkginstallerOpts_install    = "install";
+static const char*      s_pkginstallerOpts_remove     = "remove";
+
+static const char * const s_verifyExec                = "@WEBOS_INSTALL_BINDIR@/openssl";
+static const char * const s_verifyKeyOpts[]	=	{ "dgst","-sha1","-verify","-signature" };
+#if !defined(TARGET_DESKTOP)
+static const char * const s_verifyCertOpts[] = { "verify" , "-CAfile" , "@WEBOS_INSTALL_SYSCONFDIR@/ssl/certs/appsigning-bundle.crt"};
+static const char * const s_revocationCertFile = "@WEBOS_INSTALL_SYSCONFDIR@/ssl/certs/pubsubsigning-bundle.crt";
+#else
+static const char * const s_verifyCertOpts[] = { "verify" , "-CAfile" , "@WEBOS_INSTALL_SYSCONFDIR@/ssl/certs/appsigning-bundle.crt"}; //CHANGEME to whatever you have set up on the desktop w.r.t. certs
+static const char * const s_revocationCertFile = "@WEBOS_INSTALL_SYSCONFDIR@/ssl/certs/pubsubsigning-bundle.crt";
+#endif
+
+static const char * const s_extractKeyOpts[] = { "x509" , "-in" , "-pubkey" , ">"};
+
+static int parseOptions(int argc, char** argv);
+static int parseSettings();
+static int doInstall(const std::string& target);
+static int doRemove(const std::string& package);
+static int doRemove(const std::string& package, const std::string& installBase);
+static bool isNonErrorProcExit(int ecode,int normalCode=0);
+static std::string trimWhitespace(const std::string& s,const std::string& drop = "\r\n\t ");
+#ifdef USE_CRYPTOFS
+static gboolean util_cryptofsMounted() __attribute__((unused));
+static gboolean util_mountCryptofs() __attribute__((unused));
+#endif
+
+bool filecopy (const std::string& srcFile, const std::string& destFile);
+
+#define KEY_STRING(cat,name,var)									\
+	{																\
+		gchar* _vs;													\
+		GError* _error = 0;											\
+		_vs=g_key_file_get_string(keyFile,cat,name,&_error);		\
+		if( !_error && _vs ) { var=(const char*)_vs; g_free(_vs); }	\
+		else g_error_free(_error);									\
+	}
+
+#define KEY_INTEGER(cat,name,var) 				\
+	{											\
+	int _v;										\
+	GError* _error = 0;							\
+	_v=g_key_file_get_integer(keyFile,cat,name,&_error);		\
+	if( !_error ) { var=_v; }					\
+	else g_error_free(_error); 					\
+	}
+
+#define KEY_BOOLEAN(cat,name,var)				\
+		{										\
+	gboolean _vb;								\
+	GError* _error = 0;							\
+	_vb=g_key_file_get_boolean(keyFile,cat,name,&_error);\
+	if( !_error ) { var=_vb; }					\
+	else g_error_free(_error); 					\
+		}
+
+#define LOG_MESSAGE(fmt...)						\
+	if (s_useSysLog)							\
+		syslog(LOG_NOTICE, fmt);				\
+	else										\
+		g_message(fmt);
+
+#define LOG_ERROR(fmt...)						\
+	if (s_useSysLog)							\
+		syslog(LOG_ERR, fmt);					\
+	else										\
+		g_critical(fmt);
+
+#define OUTPUT_STATUS(fmt...)					\
+	do {										\
+		fprintf(stdout, "status: ");			\
+		fprintf(stdout, fmt);					\
+		fprintf(stdout, "\n");					\
+		fflush(stdout); } while (0)
+
+bool filecopy (const std::string& srcFile, const std::string& destFile)
+{
+    std::ifstream s;
+    std::ofstream d;
+    s.open (srcFile.c_str(), std::ios::binary);
+    d.open (destFile.c_str(), std::ios::binary);
+    if (!s.is_open() || !d.is_open())
+        return false;
+    d << s.rdbuf ();
+    s.close();
+    d.close();
+    return true;
+}
+
+static int splitStringOnKey(std::vector<std::string>& returnSplitSubstrings,const std::string& baseStr,const std::string& delims) {
+
+	std::string base = trimWhitespace(baseStr);
+	std::string::size_type start = 0;
+	std::string::size_type mark = 0;
+	std::string extracted;
+
+	int i=0;
+	while (start < baseStr.size()) {
+		//find the start of a non-delims
+		start = baseStr.find_first_not_of(delims,mark);
+		if (start == std::string::npos)
+			break;
+		//find the end of the current substring (where the next instance of delim lives, or end of the string)
+		mark = baseStr.find_first_of(delims,start);
+		if (mark == std::string::npos)
+			mark = baseStr.size();
+
+		extracted = baseStr.substr(start,mark-start);
+		if (extracted.size() > 0) {
+			//valid string...add it
+			returnSplitSubstrings.push_back(extracted);
+			++i;
+		}
+		start=mark;
+	}
+
+	return i;
+}
+
+// Change application install path (Internal or USB)
+void setInstallBase(const std::string& appInstallPath)
+{
+	s_appInstallBase     = appInstallPath + "/apps";
+	s_appUsbInstallBase = appInstallPath + "/apps";
+	s_serviceInstallBase = appInstallPath + "/apps";
+	s_appInstallScripts  = appInstallPath + "/apps/.scripts";
+	s_appInstallTmp      = appInstallPath + "/tmp";
+}
+
+static std::string getInstallBase()
+{
+	return (s_installType == INSTALL_INTERNAL) ? s_appInstallBase : s_appDeveloperInstallBase;
+}
+
+int main(int argc, char** argv)
+{
+	// Run at low priority
+	::setpriority(PRIO_PROCESS, getpid(), 2);
+
+#ifndef USE_CRYPTOFS
+	LOG_MESSAGE("ApplicationInstallerUtility configured to not use cryptofs");
+#endif
+
+	int rc = AI_ERR_NONE;
+
+	rc = parseOptions(argc, argv);
+	if (rc != 0)
+		return rc;
+
+	rc = parseSettings();
+	if (rc != 0)
+		return rc;
+
+    // Need to make sure install folder is present
+    g_mkdir_with_parents((getInstallBase() + std::string("/") + s_appInstallRelative).c_str(), 0755);
+
+    // Also assure the folder to store pre-remove scripts is present
+    // keep it out of the app folder so that there's no way to accidentally clobber it with a package
+    g_mkdir_with_parents(s_appInstallScripts.c_str(), 0755);
+
+    // and the temp folder for installations
+    g_mkdir_with_parents(s_appInstallTmp.c_str(),0755);
+
+	if (s_command == "install")
+		rc = doInstall(s_package);
+	else if (s_command == "remove")
+		rc = doRemove(s_package);
+	else
+		rc = AI_ERR_INVALID_ARGS;
+
+	return rc;
+}
+
+static int parseOptions(int argc, char** argv)
+{
+	GError* optError = NULL;
+	GOptionContext* optContext = NULL;
+
+	gchar* optCommand = 0;
+	gchar* optPkg = 0;
+	gchar* optType = 0;
+	gchar* optLocation = 0;
+	gboolean noSysLog = false;
+
+	static GOptionEntry optEntries[] = {
+		{ "command", 'c', 0, G_OPTION_ARG_STRING, &optCommand, "Command to execute (install or remove)", "command" },
+		{ "pkg", 'p', 0, G_OPTION_ARG_STRING, &optPkg, "For install: full path to pkg, For remove: name of pkg", "package" },
+		{ "conf", 'f', 0, G_OPTION_ARG_STRING, &s_conf, "opkg conf file path", "conf" },
+		{ "verify", 'v', 0, G_OPTION_ARG_NONE, &s_ipkgVerify, "verify ipkg certificate (for install)", "verify" },
+		{ "uncompressedSizeKB", 'u', 0, G_OPTION_ARG_INT, &s_uncompressedAppSizeInKB, "Uncompressed app size in KB (for install)", "uncompressed" },
+		{ "noSyslog", 'n', 0, G_OPTION_ARG_NONE, &noSysLog, "Output to stderr instead of syslog", "no syslog" },
+		{ "type", 't', 0, G_OPTION_ARG_STRING, &optType, "Install Type: (internal or developer)", "type" },
+		// Added new parameter for changing application install base location
+		{ "location", 'l', 0, G_OPTION_ARG_STRING, &optLocation, "Install Base Location: (internal or usb)", "location" },
+		{ "downgrade", 'd', 0, G_OPTION_ARG_NONE, &s_allowDowngrade, "Allow downgrade (for install)", "downgrade" },
+		{ "reinstall", 'r', 0, G_OPTION_ARG_NONE, &s_allowReInstall, "Allow reinstall (for install)", "reinstall" },
+		{ NULL }
+	};
+
+	optContext = g_option_context_new(NULL);
+	g_option_context_add_main_entries(optContext, optEntries, NULL);
+	if (!g_option_context_parse(optContext, &argc, &argv, &optError)) {
+		LOG_ERROR("option parsing failed: %s", optError->message);
+		return AI_ERR_INVALID_ARGS;
+	}
+
+	if (optCommand == 0 || optPkg == 0) {
+		gchar* msg = g_option_context_get_help(optContext, true, NULL);
+		LOG_ERROR("%s", msg);
+		return AI_ERR_INVALID_ARGS;
+	}
+
+	s_useSysLog = !noSysLog;
+
+	if (optType)
+	{
+		if (!strcmp(optType, "internal"))
+			s_installType = INSTALL_INTERNAL;
+		else if (!strcmp(optType, "developer"))
+			s_installType = INSTALL_DEVELOPER;
+		else
+		{
+			LOG_MESSAGE("Unknown install type, set to default internal.");
+			s_installType = INSTALL_INTERNAL;
+		}
+	}
+	else
+	{
+		LOG_MESSAGE("Install type is not passed, set to default internal.");
+		s_installType = INSTALL_INTERNAL;
+	}
+
+	int rc = 0;
+	if (strcmp(optCommand, "install") == 0) {
+		LOG_MESSAGE("Install called with args: target: %s, verify: %s, uncompressed app size (in KB): %d",
+					optPkg, s_ipkgVerify ? "true" : "false", s_uncompressedAppSizeInKB);
+		s_command = "install";
+		rc = AI_ERR_NONE;
+	}
+	else if (strcmp(optCommand, "remove") == 0) {
+		LOG_MESSAGE("Remove called with args: package: %s", optPkg);
+		s_command = "remove";
+		rc = AI_ERR_NONE;
+	}
+	else {
+		gchar* msg = g_option_context_get_help(optContext, true, NULL);
+		LOG_ERROR("%s", msg);
+		rc = AI_ERR_INVALID_ARGS;
+	}
+
+	if (optLocation)
+	{
+		setInstallBase(optLocation);
+	}
+
+	s_package = optPkg;
+
+	return rc;
+}
+
+static int parseSettings()
+{
+	GKeyFile* keyFile = g_key_file_new();
+	if (!keyFile) {
+		LOG_ERROR("%s:%d, Failed to create key file", __FUNCTION__, __LINE__);
+		return AI_ERR_INTERNAL;
+	}
+
+	GError* error = 0;
+	GKeyFileFlags flags = GKeyFileFlags(G_KEY_FILE_KEEP_COMMENTS | G_KEY_FILE_KEEP_TRANSLATIONS);
+
+	if (!g_key_file_load_from_file(keyFile, s_lunaConfPath, flags, &error)) {
+		LOG_ERROR("%s:%d, Failed to read settings file, but continuing...", __FUNCTION__, __LINE__);
+		g_key_file_free(keyFile);
+		if (error)
+			g_error_free(error);
+		return AI_ERR_NONE;
+	}
+
+	std::string dbg_faillist;
+
+	KEY_STRING("General", "AppInstallBase", s_appInstallBase);
+	KEY_STRING("General", "AppInstallRelative", s_appInstallRelative);
+	KEY_STRING("General", "PackageInstallRelative", s_packageInstallRelative );
+	KEY_STRING("General", "AppInstallTemp", s_appInstallTmp);
+	KEY_INTEGER("Debug", "AppInstallerCleaner",s_cleanupCode);
+	KEY_INTEGER("Debug", "FailAtStage",s_dbg_failstage);
+	KEY_BOOLEAN("Debug", "SpectacularFailMode",s_dbg_crashfail);
+	KEY_STRING("Debug",	"FailOnlyThesePackages", dbg_faillist);
+
+	if (s_dbg_failstage > 0)
+	{
+		LOG_MESSAGE("[INSTALLER][DEBUG-WARNING] :  you are using DEBUG FAIL-AT SETTINGS!!!!! (FailAtStage is set to %d , SpectacularFailMode is %s )",s_dbg_failstage,(s_dbg_crashfail ? "true" : "false"));
+		if (!dbg_faillist.empty())
+		{
+			int numPaths = splitStringOnKey(s_dbg_failpackages,dbg_faillist,":");
+			LOG_MESSAGE("[INSTALLER][DEBUG-WARNING] : %d fail-packages defined: ",numPaths);
+			for (std::vector<std::string>::iterator iter = s_dbg_failpackages.begin();iter != s_dbg_failpackages.end();++iter)
+			{
+				LOG_MESSAGE("[INSTALLER][DEBUG-WARNING] : fail-package [%s]",iter->c_str());
+			}
+		}
+	}
+	g_key_file_free(keyFile);
+	return AI_ERR_NONE;
+}
+
+static int doInstall(const std::string& target)
+{
+	gchar * argv[16] = {0};
+	gchar * envp[16] = {0};
+	GError * gerr = NULL;
+	gint exit_status=0;
+	GSpawnFlags flags;
+	std::string cmdline;
+	std::string installbase = getInstallBase();
+
+	OUTPUT_STATUS("starting");
+
+	if (target.empty()) {
+		LOG_ERROR("%s:%d: Target is empty", __FUNCTION__, __LINE__);
+		return AI_ERR_INSTALL_TARGETNOTFOUND;
+	}
+
+	//STEP 0:  CHECK EXISTENCE OF TARGET PKG, CHECK SPACE, THEN MAKE A TEMP DIRECTORY FOR THE UNPACK
+
+	struct stat stBuf;
+	if (0 != ::stat(target.c_str(), &stBuf)) {
+		LOG_ERROR("%s:%d: Target not found", __FUNCTION__, __LINE__);
+		return AI_ERR_INSTALL_TARGETNOTFOUND;
+	}
+
+#ifdef USE_CRYPTOFS
+	// Check if cryptofs is mounted
+	if (!util_cryptofsMounted()) {
+		LOG_ERROR("%s: Cryptofs not mounted", __PRETTY_FUNCTION__);
+		if (!util_mountCryptofs()) {
+			LOG_ERROR("%s: Failed to mount cryptofs", __PRETTY_FUNCTION__);
+			return AI_ERR_INSTALL_NOTENOUGHINSTALLSPACE;
+		}
+		LOG_MESSAGE("%s: Successfully mounted cryptfos", __PRETTY_FUNCTION__);
+	}
+#endif
+
+	// Some process spawn flags were removed to catch errors in the package manager if any.
+	flags = (GSpawnFlags)(G_SPAWN_SEARCH_PATH); // | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL);
+
+	//TODO: Coverity is gonna have a mega super awesome field day with all this!  =(
+	int index = 0;
+	argv[index++] = (gchar *)s_pkginstallerExec;
+	argv[index++] = (gchar *)s_pkginstallerOpts_location;
+	argv[index++] = (gchar *)installbase.c_str();
+	argv[index++] = (gchar *)s_pkginstallerOpts_install;
+	argv[index++] = (gchar *)target.c_str();
+	argv[index++] = (gchar *)s_pkginstallerOpts_conf;
+	argv[index++] = (gchar *)s_conf.c_str();
+	if (s_allowDowngrade)
+		argv[index++] = (gchar *) "--force-downgrade";
+	if (s_allowReInstall)
+		argv[index++] = (gchar *) "--force-reinstall";
+	argv[index++] = NULL;
+
+	index = 0;
+	envp[index++] = (gchar *) "OPKG_USE_VFORK=yes";
+	envp[index++] = NULL;
+
+	LOG_MESSAGE("Step 3: executing: %s %s %s %s %s %s %s %s %s",argv[0],argv[1],argv[2],argv[3],argv[4],argv[5],argv[6],(argv[7] == NULL)?"":argv[7],(argv[8] == NULL)?"":argv[8]);
+	gboolean resultStatus = g_spawn_sync(NULL,
+			argv,
+			envp,
+			flags,
+			NULL,
+			NULL,
+			NULL,
+			NULL,
+			&exit_status,
+			&gerr);
+
+	LOG_MESSAGE("Step 3: ipkg resultStatus = %d , exit status = %d",(int)resultStatus,(int)WEXITSTATUS(exit_status));
+	if (gerr) {
+		LOG_ERROR("Step 1: error: %s",gerr->message);
+		g_error_free(gerr);
+		gerr=NULL;
+	}
+
+	if (resultStatus) {
+		if (isNonErrorProcExit((int)exit_status) == false) {
+			LOG_ERROR("Non zero exit code from %s install", s_pkginstallerExec);
+			return AI_ERR_INSTALL_FAILEDIPKGINST;
+		}
+	}
+	else {
+		//failed to exec ipkg command
+		LOG_ERROR("Failed to execute %s command", s_pkginstallerExec);
+		return AI_ERR_INSTALL_FAILEDIPKGINST;
+	}
+
+	//success!
+	LOG_MESSAGE("Install Completed, returning AI_ERR_NONE");
+	OUTPUT_STATUS("done");
+	return AI_ERR_NONE;
+}
+
+static int doRemove(const std::string& package, const std::string& installBase)
+{
+	std::string packagePathFull = installBase + std::string("/") + s_packageInstallRelative + std::string("/") + package;
+	if (-1 == access(packagePathFull.c_str(), F_OK))
+	{
+		// try alternate way
+		std::string appPathFull = installBase + std::string("/") + s_appInstallRelative + std::string("/") + package;
+		if (-1 == access(appPathFull.c_str(), F_OK))
+			return AI_ERR_INSTALL_TARGETNOTFOUND;
+	}
+
+	gchar * argv[16] = {0};
+	GError * gerr = NULL;
+	gint exit_status = 0;
+	GSpawnFlags flags = (GSpawnFlags)(G_SPAWN_SEARCH_PATH);
+
+	int index = 0;
+	argv[index++] = (gchar *)s_pkginstallerExec;
+	argv[index++] = (gchar *)s_pkginstallerOpts_remove;
+	argv[index++] = (gchar *)package.c_str();
+	argv[index++] = (gchar *)s_pkginstallerOpts_location;
+	argv[index++] = (gchar *)installBase.c_str();
+	argv[index++] = (gchar *)s_pkginstallerOpts_conf;
+	argv[index++] = (gchar *)s_conf.c_str();
+	argv[index++] = NULL;
+
+	LOG_MESSAGE("Step 1: executing: %s %s %s %s %s %s %s", argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]);
+	gboolean resultStatus = g_spawn_sync(NULL,
+				argv,
+				NULL,
+				flags,
+				NULL,
+				NULL,
+				NULL,
+				NULL,
+				&exit_status,
+				&gerr);
+
+	LOG_MESSAGE("Step 1: ipkg resultStatus = %d, exit status = %d", (int)resultStatus, (int)WEXITSTATUS(exit_status));
+	if (gerr)
+	{
+		LOG_ERROR("Step 1: error: %s", gerr->message);
+		g_error_free(gerr);
+		gerr = NULL;
+	}
+
+	if (resultStatus)
+	{
+		if (!isNonErrorProcExit((int)exit_status))
+		{
+			LOG_ERROR("Non zero exit code from %s install", s_pkginstallerExec);
+			return AI_ERR_REMOVE_FAILEDIPKGREMOVE;
+		}
+	}
+	else
+	{
+		//failed to exec ipkg command
+		LOG_ERROR("Failed to execute %s command", s_pkginstallerExec);
+		return AI_ERR_REMOVE_FAILEDIPKGREMOVE;
+	}
+
+	return AI_ERR_NONE;
+}
+
+static int doRemove(const std::string& package)
+{
+	OUTPUT_STATUS("starting");
+
+	std::vector<std::string> appInstallPaths;
+	if (s_installType == INSTALL_DEVELOPER)
+	{
+		appInstallPaths.push_back(s_appDeveloperInstallBase);
+		// appInstallPaths includes USB app. install base path
+		appInstallPaths.push_back(s_appUsbInstallBase);
+	}
+	else
+	{
+		appInstallPaths.push_back(s_appInternalInstallBase);
+		appInstallPaths.push_back(s_appDeveloperInstallBase);
+		// appInstallPaths includes USB app. install base path
+		appInstallPaths.push_back(s_appUsbInstallBase);
+	}
+
+	std::vector<std::string>::iterator it;
+	int ret = AI_ERR_NONE;
+	int removedCount = 0;
+	for(it=appInstallPaths.begin();it!=appInstallPaths.end();++it)
+	{
+		ret = doRemove(package, *it);
+		if (ret == AI_ERR_NONE)
+			++removedCount;
+		else
+		{
+			if (ret != AI_ERR_INSTALL_TARGETNOTFOUND)
+				return ret;
+		}
+	}
+
+	if (!removedCount)
+		return AI_ERR_INSTALL_TARGETNOTFOUND;
+
+	//success!
+	LOG_MESSAGE("Remove Completed, returning AI_ERR_NONE");
+	OUTPUT_STATUS("done");
+
+	return AI_ERR_NONE;
+}
+
+static bool isNonErrorProcExit(int ecode,int normalCode)
+{
+	if (!WIFEXITED(ecode))
+		return false;
+	if (WEXITSTATUS(ecode) != normalCode)
+		return false;
+
+	return true;
+}
+
+std::string trimWhitespace(const std::string& s,const std::string& drop)
+{
+	std::string::size_type first = s.find_first_not_of( drop );
+	std::string::size_type last  = s.find_last_not_of( drop );
+
+	if( first == std::string::npos || last == std::string::npos ) return std::string( "" );
+	return s.substr( first, last - first + 1 );
+}
+
+#ifdef USE_CRYPTOFS
+static gboolean util_cryptofsMounted()
+{
+	gchar* contents = 0;
+	gsize length = 0;
+
+	gboolean res = g_file_get_contents("/proc/mounts", &contents, &length, NULL);
+	if (!res || !contents || !length)
+		return FALSE;
+
+	gchar* entry = g_strrstr(contents, "cryptofs");
+	res = (entry != NULL);
+
+	g_free(contents);
+
+	return res;
+}
+
+static gboolean util_mountCryptofs()
+{
+	int ret = ::system("/usr/bin/mountcfs");
+	return isNonErrorProcExit(ret);
+}
+#endif
