@@ -29,6 +29,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <errno.h>
+#include <bits/stdc++.h>
 
 #include <stdlib.h>
 #include <sys/wait.h>
@@ -72,6 +73,7 @@ static std::string s_serviceInstallRelative = "usr/palm/services";
 static std::string s_packageInstallRelative = "usr/palm/packages";
 static std::string s_servicePostInstallScript = "@WEBOS_INSTALL_BINDIR@/pmServicePostInstall.sh";
 static std::string s_findFileScript = "@WEBOS_INSTALL_BINDIR@/find_file_in_archive.sh";
+static std::string s_archIndexFilePath = "/etc/opkg/arch.conf";
 
 static std::string s_command;
 static std::string s_package;
@@ -128,7 +130,7 @@ static const char*      s_pkginstallerOpts_location   = "-o";
 static const char*      s_pkginstallerOpts_conf       = "-f";
 static const char*      s_pkginstallerOpts_install    = "install";
 static const char*      s_pkginstallerOpts_remove     = "remove";
-
+static const char*		s_pkginstallerArchOpts		  = "--add-arch";
 static const char * const s_verifyExec                = "@WEBOS_INSTALL_BINDIR@/openssl";
 static const char * const s_verifyKeyOpts[]	=	{ "dgst","-sha1","-verify","-signature" };
 #if !defined(TARGET_DESKTOP)
@@ -435,13 +437,14 @@ static int parseSettings()
 
 static int doInstall(const std::string& target)
 {
-	gchar * argv[16] = {0};
+	gchar * argv[58] = {0};
 	gchar * envp[16] = {0};
 	GError * gerr = NULL;
 	gint exit_status=0;
 	GSpawnFlags flags;
 	std::string cmdline;
 	std::string installbase = getInstallBase();
+	std::vector<std::string> archIndexArr;
 
 	OUTPUT_STATUS("starting");
 
@@ -473,11 +476,35 @@ static int doInstall(const std::string& target)
 	// Some process spawn flags were removed to catch errors in the package manager if any.
 	flags = (GSpawnFlags)(G_SPAWN_SEARCH_PATH); // | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL);
 
+	std::ifstream archFile;
+	archFile.open (s_archIndexFilePath);
+	if (archFile.is_open()) {
+		while(!archFile.eof()) {
+			std::string junkData; // Remove "arch" from the line (e.g. arch all 1)
+			std::string arch; // Extract arch type from the line
+			std::string priority; // Extract priority index of arch from the line
+			getline(archFile, junkData, ' ');
+			getline(archFile, arch, ' ');
+			getline(archFile, priority, '\n');
+			if (!arch.empty())
+				archIndexArr.push_back(arch + ":" + priority);
+		}
+		archFile.close();
+	}
+	else
+		LOG_ERROR("%s: Arch File not found", __PRETTY_FUNCTION__);
+
 	//TODO: Coverity is gonna have a mega super awesome field day with all this!  =(
 	int index = 0;
 	argv[index++] = (gchar *)s_pkginstallerExec;
 	argv[index++] = (gchar *)s_pkginstallerOpts_location;
 	argv[index++] = (gchar *)installbase.c_str();
+	if (!archIndexArr.empty()) {
+		for (auto it = archIndexArr.begin(); it != archIndexArr.end(); it++) {
+			argv[index++] = (gchar *)s_pkginstallerArchOpts;
+			argv[index++] = (gchar *)(*it).c_str();
+		}
+	}
 	argv[index++] = (gchar *)s_pkginstallerOpts_install;
 	argv[index++] = (gchar *)target.c_str();
 	argv[index++] = (gchar *)s_pkginstallerOpts_conf;
@@ -488,11 +515,19 @@ static int doInstall(const std::string& target)
 		argv[index++] = (gchar *) "--force-reinstall";
 	argv[index++] = NULL;
 
+	std::string logMessage;
+	for (int i = 0; i <= index; i++) {
+		if (argv[i] != NULL)
+			logMessage += " " + std::string(argv[i]);
+		else
+			break;
+	}
+
 	index = 0;
 	envp[index++] = (gchar *) "OPKG_USE_VFORK=yes";
 	envp[index++] = NULL;
 
-	LOG_MESSAGE("Step 3: executing: %s %s %s %s %s %s %s %s %s",argv[0],argv[1],argv[2],argv[3],argv[4],argv[5],argv[6],(argv[7] == NULL)?"":argv[7],(argv[8] == NULL)?"":argv[8]);
+	LOG_MESSAGE("Step 3: executing:%s", logMessage.c_str());
 	gboolean resultStatus = g_spawn_sync(NULL,
 			argv,
 			envp,
