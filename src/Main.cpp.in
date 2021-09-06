@@ -1,4 +1,4 @@
-// Copyright (c) 2009-2018 LG Electronics, Inc.
+// Copyright (c) 2009-2021 LG Electronics, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -437,7 +437,7 @@ static int parseSettings()
 
 static int doInstall(const std::string& target)
 {
-	gchar * argv[58] = {0};
+	gchar * argv[28] = {0};
 	gchar * envp[16] = {0};
 	GError * gerr = NULL;
 	gint exit_status=0;
@@ -499,11 +499,13 @@ static int doInstall(const std::string& target)
 	argv[index++] = (gchar *)s_pkginstallerExec;
 	argv[index++] = (gchar *)s_pkginstallerOpts_location;
 	argv[index++] = (gchar *)installbase.c_str();
-	if (!archIndexArr.empty()) {
-		for (auto it = archIndexArr.begin(); it != archIndexArr.end(); it++) {
-			argv[index++] = (gchar *)s_pkginstallerArchOpts;
-			argv[index++] = (gchar *)(*it).c_str();
-		}
+	if(std::find_if(archIndexArr.begin(), archIndexArr.end(), [](const std::string& str){return str.find("qemux86") != std::string::npos;}) != archIndexArr.end())
+	{
+	for (auto it = archIndexArr.begin(); it != archIndexArr.end(); it++)
+	{
+	argv[index++] = (gchar *)s_pkginstallerArchOpts;
+	argv[index++] = (gchar *)(*it).c_str();
+	}
 	}
 	argv[index++] = (gchar *)s_pkginstallerOpts_install;
 	argv[index++] = (gchar *)target.c_str();
