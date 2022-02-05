@@ -77,7 +77,7 @@ static std::string s_archIndexFilePath = "/etc/opkg/arch.conf";
 
 static std::string s_command;
 static std::string s_package;
-static std::string s_conf;
+static std::string s_conf = "/etc/opkg/opkg.conf";
 static bool        s_useSysLog = true;
 
 static int 		   s_cleanupCode = 3;			//0 = clean up nothing, 1 = clean up target package , 2 = clean up temp dir   (bitfield)
