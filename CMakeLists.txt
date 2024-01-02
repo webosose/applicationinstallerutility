@@ -1,4 +1,4 @@
-# Copyright (c) 2009-2018 LG Electronics, Inc.
+# Copyright (c) 2009-2024 LG Electronics, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ else()
 endif()
 
 include(webOS/webOS)
-include(webOS/LegacyDefines)
 
 webos_modules_init(1 0 0 QUALIFIER RC4)
 webos_component(3 0 0)
@@ -45,8 +44,6 @@ webos_add_compiler_flags(ALL ${GLIB2_CFLAGS_OTHER})
 pkg_check_modules(PMLOGLIB REQUIRED PmLogLib)
 include_directories(${PMLOGLIB_INCLUDE_DIRS})
 webos_add_compiler_flags(ALL ${PMLOGLIB_CFLAGS_OTHER})
-
-webos_machine_impl_dep()
 
 # Turn on all warnings except deprecated declarations and make them into errors
 webos_add_compiler_flags(ALL -Wall -Wno-deprecated-declarations)
